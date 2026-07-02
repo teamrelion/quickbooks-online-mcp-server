@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 
+import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { QuickbooksMCPServer } from "./server/qbo-mcp-server.js";
+import { quickbooksClient } from "./clients/quickbooks-client.js";
 // import { ListInvoicesTool } from "./tools/list-invoices.tool.js";
 // import { CreateCustomerTool } from "./tools/create-customer.tool.js";
 import { CreateInvoiceTool } from "./tools/create-invoice.tool.js";
@@ -29,6 +34,8 @@ import { CreateEstimateTool } from "./tools/create-estimate.tool.js";
 import { GetEstimateTool } from "./tools/get-estimate.tool.js";
 import { UpdateEstimateTool } from "./tools/update-estimate.tool.js";
 import { DeleteEstimateTool } from "./tools/delete-estimate.tool.js";
+import { SendEstimateTool } from "./tools/send-estimate.tool.js";
+import { GetEstimatePdfTool } from "./tools/get-estimate-pdf.tool.js";
 import { SearchCustomersTool } from "./tools/search-customers.tool.js";
 import { SearchEstimatesTool } from "./tools/search-estimates.tool.js";
 import { CreateBillTool } from "./tools/create-bill.tool.js";
@@ -200,9 +207,119 @@ import { GetAgedPayablesTool } from "./tools/get-aged-payables.tool.js";
 import { GetVendorExpensesTool } from "./tools/get-vendor-expenses.tool.js";
 import { GetVendorBalanceTool } from "./tools/get-vendor-balance.tool.js";
 
-const main = async () => {
+const readJsonBody = async (req: http.IncomingMessage): Promise<unknown> => {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const rawBody = Buffer.concat(chunks).toString("utf8");
+  return rawBody ? JSON.parse(rawBody) : undefined;
+};
+
+const startHttpServer = async (createServer: () => ReturnType<typeof QuickbooksMCPServer.CreateServer>) => {
+  const host = process.env.MCP_HOST || "127.0.0.1";
+  const port = Number.parseInt(process.env.MCP_PORT || "37373", 10);
+  const path = process.env.MCP_PATH || "/mcp";
+  const allowedHosts = (process.env.MCP_ALLOWED_HOSTS || `127.0.0.1:${port},localhost:${port}`)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_PORT: ${process.env.MCP_PORT}`);
+  }
+
+  if (host !== "127.0.0.1" && host !== "localhost") {
+    throw new Error("Refusing to start HTTP MCP server unless MCP_HOST is 127.0.0.1 or localhost");
+  }
+
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  const httpServer = http.createServer(async (req, res) => {
+    const requestUrl = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
+
+    if (requestUrl.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, transport: "streamable-http" }));
+      return;
+    }
+
+    if (requestUrl.pathname !== path) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not Found");
+      return;
+    }
+
+    try {
+      const sessionId = req.headers["mcp-session-id"];
+      let transport: StreamableHTTPServerTransport | undefined;
+      let parsedBody: unknown;
+
+      if (typeof sessionId === "string") {
+        transport = transports[sessionId];
+      }
+
+      if (!transport && req.method === "POST") {
+        parsedBody = await readJsonBody(req);
+
+        if (isInitializeRequest(parsedBody)) {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            enableDnsRebindingProtection: true,
+            allowedHosts,
+            onsessioninitialized: (newSessionId) => {
+              transports[newSessionId] = transport!;
+            },
+          });
+
+          transport.onclose = () => {
+            if (transport?.sessionId) {
+              delete transports[transport.sessionId];
+            }
+          };
+
+          transport.onerror = (error) => {
+            console.error("[mcp-http] transport error:", error);
+          };
+
+          await createServer().connect(transport);
+        }
+      }
+
+      if (!transport) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: invalid or missing MCP session" },
+          id: null,
+        }));
+        return;
+      }
+
+      await transport.handleRequest(req, res, parsedBody);
+    } catch (error) {
+      console.error("[mcp-http] request error:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        }));
+      }
+    }
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(`[mcp-http] listening on http://${host}:${port}${path}`);
+  });
+};
+
+const createConfiguredServer = () => {
   // Create an MCP server
-  const server = QuickbooksMCPServer.GetServer();
+  const server = QuickbooksMCPServer.CreateServer();
   // Add tools for customers
   RegisterTool(server, CreateCustomerTool);
   RegisterTool(server, GetCustomerTool);
@@ -214,6 +331,8 @@ const main = async () => {
   RegisterTool(server, GetEstimateTool);
   RegisterTool(server, UpdateEstimateTool);
   RegisterTool(server, DeleteEstimateTool);
+  RegisterTool(server, SendEstimateTool);
+  RegisterTool(server, GetEstimatePdfTool);
   RegisterTool(server, SearchEstimatesTool);
   
   // Add tools for bills
@@ -423,6 +542,18 @@ const main = async () => {
   RegisterTool(server, GetAgedPayablesTool);
   RegisterTool(server, GetVendorExpensesTool);
   RegisterTool(server, GetVendorBalanceTool);
+
+  return server;
+};
+
+const main = async () => {
+  if (process.env.MCP_TRANSPORT === "http" || process.argv.includes("--http")) {
+    quickbooksClient.startSessionGuard();
+    await startHttpServer(createConfiguredServer);
+    return;
+  }
+
+  const server = createConfiguredServer();
 
   // Start receiving messages on stdin and sending messages on stdout
   const transport = new StdioServerTransport();

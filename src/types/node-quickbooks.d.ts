@@ -22,6 +22,9 @@ declare module 'node-quickbooks' {
     // Estimate CRUD
     findEstimates(options: object, callback: (err: any, estimates: any) => void): void;
     createEstimate(estimateData: object, callback: (err: any, estimate: any) => void): void;
+    sendEstimatePdf(id: string, sendTo: string, callback: (err: any, estimate: any) => void): void;
+    sendEstimatePdf(id: string, callback: (err: any, estimate: any) => void): void;
+    getEstimatePdf(id: string, callback: (err: any, pdf: any) => void): void;
     getEstimate(id: string, callback: (err: any, estimate: any) => void): void;
     updateEstimate(estimateData: object, callback: (err: any, estimate: any) => void): void;
     deleteEstimate(idOrEntity: any, callback: (err: any, response: any) => void): void;

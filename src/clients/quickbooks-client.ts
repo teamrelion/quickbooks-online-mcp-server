@@ -33,6 +33,8 @@ const client_id = process.env.QUICKBOOKS_CLIENT_ID;
 const client_secret = process.env.QUICKBOOKS_CLIENT_SECRET;
 const refresh_token = process.env.QUICKBOOKS_REFRESH_TOKEN;
 const realm_id = process.env.QUICKBOOKS_REALM_ID;
+const access_token = process.env.QUICKBOOKS_ACCESS_TOKEN;
+const access_token_expires_at = process.env.QUICKBOOKS_ACCESS_TOKEN_EXPIRES_AT;
 const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox';
 // Fix for Issue #5: Use env var with underscore (QUICKBOOKS_REDIRECT_URI)
 const redirect_uri = process.env.QUICKBOOKS_REDIRECT_URI || 'http://localhost:8000/callback';
@@ -58,9 +60,11 @@ export class QuickbooksClient {
   private oauthClient: OAuthClient;
   private isAuthenticating: boolean = false;
   private redirectUri: string;
+  private sessionGuardTimer?: NodeJS.Timeout;
 
   // Refresh 5 minutes before actual expiry to avoid edge cases
   private static readonly TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+  private static readonly TOKEN_GUARD_RETRY_MS = 60 * 1000;
 
   // Shared in-flight refresh promise so that concurrent callers all await the
   // same network request rather than racing to use (and rotate) the refresh
@@ -77,6 +81,8 @@ export class QuickbooksClient {
     clientSecret: string;
     refreshToken?: string;
     realmId?: string;
+    accessToken?: string;
+    accessTokenExpiresAt?: string;
     environment: string;
     redirectUri: string;
   }) {
@@ -84,6 +90,13 @@ export class QuickbooksClient {
     this.clientSecret = config.clientSecret;
     this.refreshToken = config.refreshToken;
     this.realmId = config.realmId;
+    this.accessToken = config.accessToken;
+    if (config.accessTokenExpiresAt) {
+      const parsedExpiry = new Date(config.accessTokenExpiresAt);
+      if (!Number.isNaN(parsedExpiry.getTime())) {
+        this.accessTokenExpiry = parsedExpiry;
+      }
+    }
     this.environment = config.environment;
     this.redirectUri = config.redirectUri;
     this.oauthClient = new OAuthClient({
@@ -97,6 +110,59 @@ export class QuickbooksClient {
   private isTokenExpiredOrExpiringSoon(): boolean {
     if (!this.accessToken || !this.accessTokenExpiry) return true;
     return this.accessTokenExpiry <= new Date(Date.now() + QuickbooksClient.TOKEN_REFRESH_BUFFER_MS);
+  }
+
+  private rebuildQuickbooksInstance(): QuickBooks {
+    if (!this.accessToken || !this.realmId) {
+      throw new Error('Quickbooks not authenticated');
+    }
+
+    this.quickbooksInstance = new QuickBooks(
+      this.clientId,
+      this.clientSecret,
+      this.accessToken,
+      false,
+      this.realmId,
+      this.environment === 'sandbox',
+      false,
+      null,
+      '2.0',
+      this.refreshToken
+    );
+
+    return this.quickbooksInstance;
+  }
+
+  private scheduleSessionGuard(delayMs: number): void {
+    if (this.sessionGuardTimer) {
+      clearTimeout(this.sessionGuardTimer);
+    }
+
+    this.sessionGuardTimer = setTimeout(() => {
+      void this.runSessionGuard();
+    }, Math.max(1000, delayMs));
+
+    this.sessionGuardTimer.unref?.();
+  }
+
+  private async runSessionGuard(): Promise<void> {
+    try {
+      await this.authenticate();
+      const nextRefreshAt = this.accessTokenExpiry
+        ? this.accessTokenExpiry.getTime() - Date.now() - QuickbooksClient.TOKEN_REFRESH_BUFFER_MS
+        : QuickbooksClient.TOKEN_GUARD_RETRY_MS;
+
+      console.error(`[qbo-client] Session guard healthy; next refresh check in ${Math.round(Math.max(nextRefreshAt, 1000) / 1000)}s`);
+      this.scheduleSessionGuard(nextRefreshAt);
+    } catch (error) {
+      console.error('[qbo-client] Session guard failed; retrying soon:', error);
+      this.scheduleSessionGuard(QuickbooksClient.TOKEN_GUARD_RETRY_MS);
+    }
+  }
+
+  startSessionGuard(): void {
+    if (this.sessionGuardTimer) return;
+    void this.runSessionGuard();
   }
 
   private async startOAuthFlow(): Promise<void> {
@@ -128,6 +194,9 @@ export class QuickbooksClient {
             // Save tokens
             this.refreshToken = tokens.refresh_token;
             this.realmId = tokens.realmId;
+            this.accessToken = tokens.access_token;
+            this.accessTokenExpiry = new Date(Date.now() + (tokens.expires_in || 3600) * 1000);
+            this.rebuildQuickbooksInstance();
             this.saveTokensToEnv();
 
             // Send success response
@@ -220,25 +289,44 @@ export class QuickbooksClient {
     const tokenPath = path.join(__dirname, '..', '..', '.env');
     const envContent = fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, 'utf-8') : '';
     const envLines = envContent.split('\n');
+    const updates: Record<string, string> = {};
 
-    const updateEnvVar = (name: string, value: string) => {
-      const index = envLines.findIndex(line => line.startsWith(`${name}=`));
-      if (index !== -1) {
-        envLines[index] = `${name}=${value}`;
-      } else {
-        envLines.push(`${name}=${value}`);
-      }
+    const updateEnvVar = (name: string, value: string | undefined) => {
+      if (value) updates[name] = value;
     };
 
-    if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
-    if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
+    updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
+    updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
+    updateEnvVar('QUICKBOOKS_ACCESS_TOKEN', this.accessToken);
+    updateEnvVar('QUICKBOOKS_ACCESS_TOKEN_EXPIRES_AT', this.accessTokenExpiry?.toISOString());
+
+    const written = new Set<string>();
+    const nextEnvLines = envLines.filter((line) => {
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+      if (!match || !(match[1] in updates)) return true;
+
+      const name = match[1];
+      if (written.has(name)) return false;
+      written.add(name);
+      return true;
+    }).map((line) => {
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+      if (!match || !(match[1] in updates)) return line;
+      return `${match[1]}=${updates[match[1]]}`;
+    });
+
+    for (const [name, value] of Object.entries(updates)) {
+      if (!written.has(name)) {
+        nextEnvLines.push(`${name}=${value}`);
+      }
+    }
 
     // Atomic write: write to a sibling temp file, then rename. On POSIX rename
     // is atomic within the same filesystem, so a crash mid-write cannot leave
     // .env half-written or empty.
     const tmpPath = `${tokenPath}.tmp.${process.pid}`;
     try {
-      fs.writeFileSync(tmpPath, envLines.join('\n'), { mode: 0o600 });
+      fs.writeFileSync(tmpPath, `${nextEnvLines.filter((line, index) => line !== '' || index < nextEnvLines.length - 1).join('\n')}\n`, { mode: 0o600 });
       fs.renameSync(tmpPath, tokenPath);
     } catch (err) {
       try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
@@ -280,20 +368,30 @@ export class QuickbooksClient {
         const expiresIn = token.expires_in || 3600;
         this.accessTokenExpiry = new Date(Date.now() + expiresIn * 1000);
 
-        // Intuit rotates the refresh token (typically every ~24h). When a new
-        // one is issued we MUST persist it — the old value in .env becomes
-        // stale and will eventually stop working, silently breaking refresh.
+        // Always persist the refresh token after every successful refresh.
+        // QB may or may not rotate it; saving unconditionally ensures .env
+        // always holds the most recently confirmed-valid token so the next
+        // process restart doesn't start with a stale value.
         const newRefreshToken = token.refresh_token;
         if (newRefreshToken && newRefreshToken !== this.refreshToken) {
+          console.error('[qbo-client] Refresh token rotated — persisting to .env');
           this.refreshToken = newRefreshToken;
-          try {
-            this.saveTokensToEnv();
-            console.error('[qbo-client] Refresh token rotated and persisted to .env');
-          } catch (persistErr) {
-            // Don't fail the whole refresh just because we couldn't write to
-            // disk; the in-memory token is still valid for this process.
-            console.error('[qbo-client] Failed to persist rotated refresh token:', persistErr);
-          }
+        }
+
+        if (newRefreshToken) {
+          this.refreshToken = newRefreshToken;
+        }
+
+        if (this.realmId) {
+          this.rebuildQuickbooksInstance();
+        }
+
+        try {
+          this.saveTokensToEnv();
+        } catch (persistErr) {
+          // Don't fail the whole refresh just because we couldn't write to
+          // disk; the in-memory token is still valid for this process.
+          console.error('[qbo-client] Failed to persist refreshed tokens:', persistErr);
         }
 
         // Surface the refresh token's own remaining lifetime for observability.
@@ -341,20 +439,7 @@ export class QuickbooksClient {
         }
 
         // Always rebuild with the current fresh access token
-        this.quickbooksInstance = new QuickBooks(
-          this.clientId,
-          this.clientSecret,
-          this.accessToken!,
-          false, // no token secret for OAuth 2.0
-          this.realmId!,
-          this.environment === 'sandbox',
-          false, // debug?
-          null,  // minor version
-          '2.0', // oauth version
-          this.refreshToken
-        );
-
-        return this.quickbooksInstance;
+        return this.rebuildQuickbooksInstance();
       } finally {
         this.authInFlight = undefined;
       }
@@ -407,6 +492,8 @@ export const quickbooksClient = new QuickbooksClient({
   clientSecret: client_secret,
   refreshToken: refresh_token,
   realmId: realm_id,
+  accessToken: access_token,
+  accessTokenExpiresAt: access_token_expires_at,
   environment: environment,
   redirectUri: redirect_uri,
 });
